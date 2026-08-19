@@ -1,20 +1,21 @@
 # nanocode+
 
-A terminal-based coding agent that combines a **tool-calling REPL**, a **DAG-based project planner**, **per-step README tracking**, and **automatic test generation**. Point it at a project description and it will break the work into a dependency graph, generate Python code for each step, write a README for every step, and (optionally) generate and run tests — all while keeping enough context around that later steps know what earlier steps produced.
+A single-file terminal coding agent. It runs a tool-calling REPL against an OpenAI-compatible API (OpenRouter by default), and can optionally break a project into a dependency graph of steps, generate Python code for each step, write a short README per step, and run generated pytest tests.
 
 ---
 
-## Features
+## What it actually does
 
-- **Interactive REPL** — chat with the agent, or hand it multi-step tasks that it plans with a `todo_write` tool call.
-- **Tool-calling agent loop** — the agent can `read_file`, `write_file`, `edit_file`, `bash`, `grep`, `list_files`, and `todo_write`, streamed against an OpenAI-compatible (OpenRouter) endpoint.
-- **Project planning (`/plan`)** — describe a project in natural language and the agent returns a DAG of implementation steps (`TaskGraph`).
-- **Graph execution (`/run`)** — steps are executed in dependency order; each step's generated code is validated to reject shell commands disguised as Python.
-- **Per-step documentation** — every completed step gets a generated `README_<node_id>.md` (`ReadmeManager` / `ReadmeContent`) summarizing its logic, variables, dependencies, and what depends on it. Downstream steps receive this as context.
-- **Auto-testing** — when `AUTO_TEST=true`, pytest tests are generated and run against each step's code, and the step's status (`completed` / `failed`) reflects the result.
-- **Plan mode (`/plan` toggle)** — dry-run mode that blocks `write_file`/`edit_file`/`bash` so you can preview what the agent intends to do.
-- **Metrics tracking** — running counts of completed/failed tasks, retries, and test pass rate.
-- **Config persistence** — settings load from environment variables and `nanocode_config.json`; the API key is always sourced from the environment and never written to disk.
+- **REPL** (`repl()`) — reads user input, dispatches slash commands, otherwise sends the message into the tool-calling loop.
+- **Tool-calling loop** (`_run_loop()`) — streams a chat completion, collects any tool calls, executes them via `execute_tool()`, feeds results back, and repeats until the model stops calling tools or `max_iterations` is hit.
+- **Tools** (`execute_tool()`) — `read_file`, `write_file`, `edit_file`, `bash`, `grep`, `list_files`, `todo_write`. `write_file` and `bash` ask for a `y/N` confirmation unless `auto_approve` is set.
+- **Planning** (`plan_project()`) — sends the project description to the LLM, parses a JSON DAG out of the response, and builds a `TaskGraph` of `TaskNode`s.
+- **Graph execution** (`_execute_graph()` / `_execute_step()`) — runs ready nodes (all dependencies completed) one at a time: generates Python code for the step, rejects output that looks like shell commands (retrying up to 3 times), writes `<node_id>.py`, writes a `README_<node_id>.md` via `ReadmeManager`, and optionally runs `_run_test()`.
+- **Tests** (`_run_test()`) — asks the LLM to write pytest for the generated code, writes `test_<node_id>.py`, runs `pytest`, and returns pass/fail.
+- **Config** (`Config`) — loaded from environment variables, then overridden by `nanocode_config.json` (except `api_key`, which always comes from the environment and is never written to disk).
+- **Metrics** (`Metrics`) — a counter dataclass with a `record()` method. Note: nothing in the current code calls `record()`, so `tasks_completed` / `tasks_failed` / `test_pass_rate` stay at their defaults even though `/status` displays them.
+
+That's the whole system — one process, one file, no external services beyond the LLM API.
 
 ---
 
@@ -22,93 +23,49 @@ A terminal-based coding agent that combines a **tool-calling REPL**, a **DAG-bas
 
 ```mermaid
 flowchart TB
-    subgraph Entry["Entry Point"]
-        MAIN["main()"]
-    end
+    MAIN["main()"] --> CFG["Config\n(env vars + nanocode_config.json)"]
+    CFG --> AGENT
 
-    subgraph Config_Layer["Configuration"]
-        CFG["Config\n(env vars + nanocode_config.json)"]
-    end
-
-    subgraph Agent["NanoCodePlus (orchestrator)"]
-        REPL["repl()\ninteractive loop"]
-        RUNLOOP["_run_loop()\ntool-calling loop"]
+    subgraph AGENT["NanoCodePlus"]
+        direction TB
+        REPL["repl()"]
+        RUNLOOP["_run_loop()"]
         PLAN["plan_project()"]
-        EXEC["_execute_graph() / _execute_step()"]
+        EXEC["_execute_step()"]
         TEST["_run_test()"]
-        STATUS["_show_status()"]
     end
 
-    subgraph LLM_Layer["LLM Client"]
-        LLMC["LLMClient\n(OpenAI-compatible / OpenRouter)"]
-    end
-
-    subgraph Planning["Planning & State"]
-        GRAPH["TaskGraph\n(nodes + edges, DAG)"]
-        NODE["TaskNode\n(id, status, deps)"]
-    end
-
-    subgraph Docs["Documentation Layer"]
-        RM["ReadmeManager"]
-        RC["ReadmeContent"]
-    end
-
-    subgraph Tools["Tool Execution"]
-        TOOLS["execute_tool()\nread_file / write_file / edit_file\nbash / grep / list_files / todo_write"]
-    end
-
-    subgraph Metrics_Layer["Metrics"]
-        MET["Metrics\n(tasks, retries, pass rate)"]
-    end
-
-    subgraph FS["Workspace (.workspace/)"]
-        SRC["src/*.py\n+ README_*.md"]
-        TESTS["tests/test_*.py"]
-        STATE["state/graph.json"]
-    end
-
-    MAIN --> CFG
-    MAIN --> Agent
-    CFG --> LLMC
-    CFG --> Agent
-
-    REPL -->|"/plan <desc>"| PLAN
+    REPL -->|"chat"| RUNLOOP
+    REPL -->|"/plan desc"| PLAN
     REPL -->|"/run"| EXEC
-    REPL -->|"/status"| STATUS
-    REPL -->|"chat message"| RUNLOOP
 
-    RUNLOOP <--> LLMC
-    RUNLOOP --> TOOLS
+    RUNLOOP <-->|"chat completion"| LLM["LLMClient\n(OpenRouter API)"]
+    RUNLOOP --> TOOLS["execute_tool()\nread/write/edit_file, bash, grep, list_files"]
 
-    PLAN --> LLMC
-    PLAN --> GRAPH
-    GRAPH --> NODE
-    GRAPH -->|save/load| STATE
+    PLAN <-->|"ask for DAG JSON"| LLM
+    PLAN --> GRAPH["TaskGraph\n(state/graph.json)"]
 
     EXEC --> GRAPH
-    EXEC --> RM
-    EXEC --> LLMC
+    EXEC <-->|"ask for code"| LLM
+    EXEC --> CODEOUT["src/&lt;id&gt;.py\nsrc/README_&lt;id&gt;.md"]
     EXEC --> TEST
-    EXEC --> MET
+    TEST <-->|"ask for tests"| LLM
+    TEST --> TESTOUT["tests/test_&lt;id&gt;.py"]
 
-    RM --> RC
-    RC -->|to_markdown| SRC
-    EXEC -->|write code| SRC
-    TEST -->|write & run pytest| TESTS
+    classDef entry fill:#0B5FFF,stroke:#063A99,stroke-width:2px,color:#FFFFFF,font-weight:bold;
+    classDef llm fill:#8E24AA,stroke:#5C1670,stroke-width:2px,color:#FFFFFF,font-weight:bold;
+    classDef fs fill:#00A389,stroke:#00695C,stroke-width:2px,color:#FFFFFF,font-weight:bold;
+    classDef node fill:#FFFFFF,stroke:#333333,stroke-width:1.5px,color:#111111;
 
-    STATUS --> MET
-    STATUS --> GRAPH
+    class MAIN entry;
+    class LLM llm;
+    class CODEOUT,TESTOUT,GRAPH fs;
+    class CFG,REPL,RUNLOOP,PLAN,EXEC,TEST,TOOLS node;
+
+    style AGENT fill:#E8F0FE,stroke:#0B5FFF,stroke-width:2px,color:#0B1F4D;
 ```
 
-**Flow summary**
-
-1. `main()` loads `Config` (env vars override nothing; `nanocode_config.json` fills in the rest) and starts the REPL.
-2. In free-chat mode, `_run_loop()` streams responses from `LLMClient`, dispatching any tool calls to `execute_tool()` and feeding results back until the model stops calling tools.
-3. `/plan <description>` asks the LLM to decompose a project into a JSON DAG, which becomes a `TaskGraph` of `TaskNode`s and is persisted to `.workspace/state/graph.json`.
-4. `/run` walks the graph in dependency order (`get_ready_nodes()`), generating Python code per node via `_execute_step()`, guarding against shell-command output, and writing the file to `.workspace/src/`.
-5. Each completed step's rationale is captured as `ReadmeContent` and rendered to `.workspace/src/README_<node_id>.md` by `ReadmeManager`, which also supplies dependency context to downstream steps.
-6. If `AUTO_TEST` is enabled, `_run_test()` generates and runs pytest tests in `.workspace/tests/`; the result marks the node `completed` or `failed`.
-7. `Metrics` accumulates success/failure/retry counts, viewable via `/status`.
+**Legend:** blue = process entry point · purple = the one external dependency (the LLM API) · teal = files written to disk · white = functions/classes inside the single `NanoCodePlus` object.
 
 ---
 
@@ -118,17 +75,20 @@ flowchart TB
 pip install openai rich python-dotenv
 ```
 
-Set your OpenRouter API key (or you'll be prompted for it on first run):
+`python-dotenv` is optional — if it's not installed, the script falls back to a manual `.env` parser.
+
+Set your OpenRouter API key (you'll be prompted for it on first run and it will be saved only to your shell environment, never to `nanocode_config.json`):
 
 ```bash
 export OPENROUTER_API_KEY="sk-or-..."
 ```
 
-Optionally create a `.env` file in the project directory:
+Optional `.env`:
 
 ```
 OPENROUTER_API_KEY=sk-or-...
 DEFAULT_MODEL=poolside/laguna-s-2.1:free
+OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 WORKSPACE_DIR=.workspace
 AUTO_APPROVE=false
 AUTO_TEST=true
@@ -145,24 +105,22 @@ python nanocode.py [--model <name>] [--auto-approve] [--workspace <dir>]
 
 ### REPL commands
 
-| Command | Description |
+| Command | Does |
 |---|---|
-| `/plan` | Toggle plan mode (blocks writes/bash so you can preview actions) |
-| `/graph` | Show the current task graph |
-| `/run` | Execute all ready steps in the task graph until complete |
-| `/status` | Show metrics, config, and the task graph |
-| `/model <name>` | Switch the active model and persist it to config |
-| `/quit`, `/exit` | Exit the REPL |
+| `/plan` | Toggles plan mode — while ON, `write_file`, `edit_file`, and `bash` are blocked (returns `"Plan mode ON - writes disabled"` instead of running) |
+| `/graph` | Prints the current task graph, if one exists |
+| `/run` | Executes all ready graph nodes until the graph completes or nothing is ready |
+| `/status` | Prints config, metrics, and the task graph |
+| `/model <name>` | Switches the active model and saves it to `nanocode_config.json` |
+| `/quit`, `/exit` | Exits |
 
-Any other input is sent to the agent as a chat message and handled by the tool-calling loop.
+Anything else typed at the prompt is sent as a chat message and handled by `_run_loop()`.
 
-### Example session
+To get a task graph in the first place, you plan it via chat (there's no dedicated `/plan <description>` argument — describe the project as a normal message, or call `plan_project()` if you're scripting against the class directly) and then run `/run`.
 
-```
-> Build a simple CLI todo app with add/list/complete commands
-```
+### Example: generating a small project
 
-The agent plans a DAG (e.g. `data_model` → `storage` → `cli_commands` → `main_entrypoint`), then `/run` executes each node, writing files like:
+Describing something like *"a CLI todo app with add/list/complete commands"* and executing the resulting graph produces files such as:
 
 ```
 .workspace/src/todo_app.py
@@ -170,42 +128,43 @@ The agent plans a DAG (e.g. `data_model` → `storage` → `cli_commands` → `m
 .workspace/tests/test_todo_app.py
 ```
 
-> **Note:** `node_todo` and `todo_app` in `.workspace/src/` are example artifacts generated *by* this CLI agent while planning and executing a sample "todo list" project — they are not part of nanocode+ itself, but sample output demonstrating the planner → codegen → README → test pipeline described above.
+> `node_todo` / `todo_app` are not part of nanocode+'s source — they're example output the agent itself generated while planning and executing a sample "todo list" project, kept as a demonstration of the planner → codegen → README → test pipeline above.
 
 ---
 
-## Project structure (generated at runtime)
+## Generated workspace layout
 
 ```
 .workspace/
 ├── src/
-│   ├── <node_id>.py            # generated implementation per graph node
-│   └── README_<node_id>.md     # generated documentation per graph node
+│   ├── <node_id>.py            # code generated for that step
+│   └── README_<node_id>.md     # summary/logic/variables for that step
 ├── tests/
-│   └── test_<node_id>.py       # generated pytest tests per graph node
+│   └── test_<node_id>.py       # pytest generated for that step (if AUTO_TEST)
 └── state/
-    └── graph.json              # persisted TaskGraph (nodes + edges)
+    └── graph.json              # persisted TaskGraph, reloaded by /run
 ```
 
 ## Configuration reference
 
-| Variable | Default | Description |
+| Variable | Default | Notes |
 |---|---|---|
-| `OPENROUTER_API_KEY` | — | Required. Never persisted to `nanocode_config.json`. |
-| `DEFAULT_MODEL` | `poolside/laguna-s-2.1:free` | Model used for chat and codegen. |
-| `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-compatible API base URL. |
-| `WORKSPACE_DIR` | `.workspace` | Root directory for generated code/tests/state. |
-| `AUTO_APPROVE` | `false` | Skip interactive confirmation for `write_file`/`bash`. |
-| `AUTO_TEST` | `true` | Generate and run pytest after each step. |
-| `MAX_README_SIZE` | `5000` | Max characters before a step README is compressed/truncated. |
-| `MAX_ITERATIONS` | `50` | Max tool-calling iterations per REPL turn. |
-| `TEMPERATURE` | `0.7` | Sampling temperature for chat/codegen calls. |
+| `OPENROUTER_API_KEY` | — | Required. Read from env only; never saved to the config file. |
+| `DEFAULT_MODEL` | `poolside/laguna-s-2.1:free` | Used for chat, planning, codegen, and test generation. |
+| `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | Any OpenAI-compatible endpoint. |
+| `WORKSPACE_DIR` | `.workspace` | Root for `src/`, `tests/`, `state/`. |
+| `AUTO_APPROVE` | `false` | Skips the `y/N` prompt for `write_file` and `bash`. |
+| `AUTO_TEST` | `true` | Generate + run pytest after each graph step. |
+| `MAX_README_SIZE` | `5000` | Step READMEs longer than this are truncated and marked `COMPRESSED`. |
+| `MAX_ITERATIONS` | `50` | Max tool-call rounds per REPL turn before giving up. |
+| `TEMPERATURE` | `0.7` | Sampling temperature for chat/codegen/test calls. |
 
-## Safety notes
+## Known limitations (as implemented)
 
-- Generated code is checked with a heuristic (`_is_shell`) to reject output that looks like shell commands rather than Python, retrying up to 3 times.
-- `write_file` and `bash` prompt for confirmation unless `auto_approve` is set.
-- Plan mode disables all filesystem/shell side effects for previewing agent behavior.
+- `Metrics.record()` is defined but never called, so `/status`'s task/retry/pass-rate numbers don't currently update.
+- Shell-command detection (`_is_shell`) is a simple keyword heuristic on generated code, not a sandbox — it reduces but doesn't eliminate the chance of shell-like output being written as "Python".
+- `bash` tool calls run with a 30-second timeout and no sandboxing beyond the approval prompt.
+- There is no CLI flag to pass a project description directly into `plan_project()` — planning currently happens through the chat REPL.
 
 ## License
 
