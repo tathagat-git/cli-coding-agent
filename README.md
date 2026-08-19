@@ -166,6 +166,3 @@ Describing something like *"a CLI todo app with add/list/complete commands"* and
 - `bash` tool calls run with a 30-second timeout and no sandboxing beyond the approval prompt.
 - There is no CLI flag to pass a project description directly into `plan_project()` — planning currently happens through the chat REPL.
 
-## License
-
-Add a license of your choice (e.g. MIT) here.
